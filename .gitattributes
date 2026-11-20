@@ -1,0 +1,16 @@
+# 这个仓库的 shell 脚本要在 Linux runner 上执行。
+# Windows 上 clone 时若开了 core.autocrlf=true，脚本会变成 CRLF，
+# 在 runner 上会报 `\r: command not found` / `bash: $'\r': 未找到命令`。
+# 这里强制 LF，避免这个坑。
+* text=auto eol=lf
+
+*.sh   text eol=lf
+*.env  text eol=lf
+*.txt  text eol=lf
+*.yml  text eol=lf
+*.yaml text eol=lf
+
+*.tar   binary
+*.gz    binary
+*.zst   binary
+*.png   binary

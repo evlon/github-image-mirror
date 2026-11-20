@@ -1,0 +1,14 @@
+# 本地取件/导出产物，不要提交
+*.tar
+*.tar.gz
+*.tar.zst
+*.tar.xz
+*.part.*
+
+# 脚本生成的取件命令清单
+pull-list.txt
+
+# 本地跑脚本时的临时目录
+.tmp/
+out/
+_release_dl/

@@ -1,0 +1,48 @@
+# =============================================================================
+# 镜像清单 —— 改完这个文件 git push，GitHub Actions 就会自动搬运到你的 registry
+#
+# 行格式：  <源镜像> [目标镜像] [选项...]
+#
+#   选项（可叠加，位置随意）：
+#     platform=linux/arm64        只搬这个平台（多平台用逗号；仅 skopeo/pull 生效）
+#     require_arch=arm64          搬完校验目标里确实有这个平台，没有就算失败
+#     mirror=<host>               这一行单独指定源镜像站（覆盖 mirrors.env）
+#
+#   目标名自动推导规则（不写第二列时）：
+#     <TARGET_REGISTRY>/<TARGET_NAMESPACE>/<源镜像全名去掉 tag，`/` 和 `.` 换成 `-`，转小写>:<tag>
+#       例：quay.io/ascend/vllm-ascend:v0.32.0rc1-a3-openeuler
+#        →  ghcr.io/<OWNER>/quay-io-ascend-vllm-ascend:v0.32.0rc1-a3-openeuler
+#       例：docker.io/library/nginx:1.27-alpine
+#        →  ghcr.io/<OWNER>/docker-io-library-nginx:1.27-alpine
+#
+#   默认**完整保留多架构 index**：同一份镜像，x86 机器和 arm64 机器取件时各拿各的。
+#   不支持 digest（@sha256:...），只按 tag 搬运。
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# 910C 部署要用的（aarch64）—— 不需要就删掉这一行
+# ---------------------------------------------------------------------------
+quay.io/ascend/vllm-ascend:v0.32.0rc1-a3-openeuler
+
+# ---------------------------------------------------------------------------
+# 常用基础镜像示例（留着不占你本地带宽，它只是 registry 里的一份副本）
+# ---------------------------------------------------------------------------
+docker.io/library/nginx:1.27-alpine
+registry.k8s.io/pause:3.10
+
+# ---------------------------------------------------------------------------
+# 用法示例（都是注释，按需放开）
+# ---------------------------------------------------------------------------
+# 显式改目标名（例如给 K8s 部署文件里写死的名字用）
+# docker.io/library/redis:7.4-alpine        ghcr.io/OWNER/redis:7.4-alpine
+#
+# 只搬单一平台 + 校验（省一半流量，适合明确只给某一类机器用的镜像）
+# quay.io/ascend/vllm-ascend:v0.32.0rc1-a3-openeuler   platform=linux/arm64 require_arch=arm64
+#
+# 只搬 amd64（老 x86 服务器）
+# docker.io/library/mysql:8.4               platform=linux/amd64 require_arch=amd64
+#
+# 这一行走独立镜像站拉源（其他行不受影响）
+# docker.io/library/postgres:17             mirror=docker.m.daocloud.io
+#
+# 私有镜像：源需要认证时，在仓库 Secrets 里配 SRC_CREDS=user:password

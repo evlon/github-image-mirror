@@ -1,0 +1,121 @@
+name: sync-images
+
+# =============================================================================
+# 触发方式
+#   1) push：改了 images.txt / mirrors.env / 同步脚本 —— 自动搬运
+#      （这就是「git push 来同步镜像」那条路）
+#   2) workflow_dispatch：手点，可临时搬运不在清单里的镜像、或只搬指定平台
+#   3) schedule：每周一兜底重扫一遍（防漏）
+#
+# 目标 registry 默认 GHCR；换成别的（Docker Hub、自建 registry）：
+#   仓库 Settings → Secrets and variables → Actions → Variables 里设
+#     TARGET_REGISTRY   例如 docker.io
+#     TARGET_NAMESPACE  例如 your-dockerhub-user
+#   并在下面「登录目标 registry」那一步补上对应 registry 的登录。
+# =============================================================================
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'images.txt'
+      - 'mirrors.env'
+      - 'scripts/mirror.sh'
+      - '.github/workflows/sync.yml'
+  workflow_dispatch:
+    inputs:
+      images:
+        description: '临时搬运这些镜像（空白/换行分隔，留空则用 images.txt）'
+        required: false
+        type: string
+      mode:
+        description: '搬运方式'
+        required: true
+        default: auto
+        type: choice
+        options: [auto, skopeo, imagetools]
+      platforms:
+        description: '只搬指定平台（留空=完整保留多架构，如 linux/arm64）'
+        required: false
+        type: string
+      require_arch:
+        description: '搬完校验目标里有这个平台（留空=不校验，如 arm64 或 linux/arm64）'
+        required: false
+        type: string
+      force:
+        description: '已存在的 tag 也重推'
+        required: true
+        default: false
+        type: boolean
+      dry_run:
+        description: '只打印计划，不实际推送'
+        required: true
+        default: false
+        type: boolean
+  schedule:
+    - cron: '17 3 * * 1'   # 每周一 03:17 UTC（北京时间 11:17）
+
+permissions:
+  contents: read
+  packages: write        # 推 GHCR 必需；换成别的 registry 可去掉
+
+concurrency:
+  group: sync-images-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - name: 拉取仓库
+        uses: actions/checkout@v4
+
+      - name: 准备 buildx（imagetools 模式用；同样是 registry→registry 直拷，不落磁盘）
+        if: ${{ inputs.mode == '' || inputs.mode == 'auto' || inputs.mode == 'imagetools' }}
+        uses: docker/setup-buildx-action@v3
+
+      - name: 安装 skopeo（只有显式选 skopeo 时才装）
+        if: ${{ inputs.mode == 'skopeo' }}
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq skopeo
+          skopeo --version
+
+      - name: 登录目标 registry（GHCR）
+        if: ${{ vars.TARGET_REGISTRY == '' || vars.TARGET_REGISTRY == 'ghcr.io' }}
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: 可选登录 Docker Hub（配了 secret 才生效，避免匿名限流）
+        env:
+          DH_USER: ${{ secrets.DOCKERHUB_USERNAME }}
+          DH_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          if [[ -n "${DH_USER:-}" && -n "${DH_TOKEN:-}" ]]; then
+            echo "$DH_TOKEN" | docker login docker.io -u "$DH_USER" --password-stdin
+          else
+            echo "没配 DOCKERHUB_USERNAME / DOCKERHUB_TOKEN，Docker Hub 走匿名（可能限流）"
+          fi
+
+      - name: 搬运镜像
+        env:
+          TARGET_REGISTRY: ${{ vars.TARGET_REGISTRY || 'ghcr.io' }}
+          TARGET_NAMESPACE: ${{ vars.TARGET_NAMESPACE || github.repository_owner }}
+          IMAGES_FILE: images.txt
+          MIRRORS_FILE: mirrors.env
+          SYNC_MODE: ${{ inputs.mode || 'auto' }}
+          # 全局默认；清单里还能逐行 platform= / require_arch= 覆盖
+          PLATFORMS: ${{ inputs.platforms || vars.PLATFORMS }}
+          REQUIRE_ARCH: ${{ inputs.require_arch || vars.REQUIRE_ARCH }}
+          FORCE: ${{ inputs.force && '1' || '' }}
+          DRY_RUN: ${{ inputs.dry_run && '1' || '' }}
+          EXTRA_IMAGES: ${{ inputs.images }}
+          JOBS: '4'
+          # skopeo 模式下用 GITHUB_TOKEN 推 GHCR；换 registry 就用自己的 secret
+          SRC_CREDS: ${{ secrets.SRC_CREDS }}
+          DEST_CREDS: ${{ secrets.DEST_CREDS || (inputs.mode == 'skopeo' && format('{0}:{1}', github.actor, secrets.GITHUB_TOKEN)) || '' }}
+        run: bash scripts/mirror.sh
+
+      - name: 结果提示
+        if: always()
+        run: |
+          echo "::notice::目标 registry = ${{ vars.TARGET_REGISTRY || 'ghcr.io' }}/${{ vars.TARGET_NAMESPACE || github.repository_owner }}；若包是 private，取件方需要凭据（或到 registry 侧改成 public）"
