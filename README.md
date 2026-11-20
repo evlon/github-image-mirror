@@ -247,10 +247,17 @@ $env:GHCR_TOKEN = 'ghp_xxx'          # classic PAT，勾 write:packages
 │   └── sync.yml                # 唯一的工作流：push 触发搬运
 └── scripts/
     ├── mirror.sh               # 搬运核心（Actions 与本地共用）
-    └── mirror.ps1              # Windows 本地版（skopeo.exe，零磁盘）
+    ├── mirror.ps1              # Windows 本地版（skopeo.exe，零磁盘）
+    └── test-arch-gate.sh       # 零网络回归测试：架构门 + 清单产出
 ```
 
 `mirror.sh` 的命名推导规则与 `mirror.ps1` 的 `Get-TargetRef` **必须保持一致** —— 改一处要同步改另一处。
+
+回归测试随时可跑，不联网、几毫秒（用假 skopeo 喂真实形态的 manifest JSON）：
+
+```bash
+bash scripts/test-arch-gate.sh
+```
 
 ---
 

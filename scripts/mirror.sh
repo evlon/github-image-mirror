@@ -443,6 +443,12 @@ sync_one() {
 
   if [[ -z "$FORCE" ]] && target_exists "$dst"; then
     printf '    tag 已存在，跳过（FORCE=1 可强制重推）\n'
+    # 已存在也要过架构门：否则"目标里躺着个缺 arm64 的镜像"会一直查不出来
+    if [[ -n "$arch" ]] && ! target_has_arch "$dst" "$arch"; then
+      warn "$dst 已存在，但里面没有 $arch"
+      emit "$idx" "FAIL" "$src" "$dst" "-" "已存在但缺 $arch"
+      return 0
+    fi
     emit "$idx" "SKIP" "$src" "$dst" "$(target_digest "$dst")" "tag 已存在"
     return 0
   fi

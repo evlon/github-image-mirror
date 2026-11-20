@@ -68,7 +68,7 @@ jobs:
     timeout-minutes: 180
     steps:
       - name: 拉取仓库
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: 准备 buildx（imagetools 模式用；同样是 registry→registry 直拷，不落磁盘）
         if: ${{ inputs.mode == '' || inputs.mode == 'auto' || inputs.mode == 'imagetools' }}
