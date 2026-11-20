@@ -135,7 +135,8 @@ fi
 
 PY="${PYTHON:-python3}"
 if command -v "$PY" >/dev/null 2>&1; then
-  if "$PY" -c "import json;json.load(open(r'$TMP/inv/inventory.json', encoding='utf-8'))" 2>/dev/null; then
+  # 走 stdin：避免把 $TMP 的 MSYS 路径交给原生 Windows 版 python（它解析不了 /tmp/...）
+  if "$PY" -c 'import json,sys; json.load(sys.stdin)' < "$TMP/inv/inventory.json" 2>/dev/null; then
     ok "inventory.json 是合法 JSON"
   else
     bad "inventory.json 不是合法 JSON"
