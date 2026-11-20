@@ -328,30 +328,36 @@ target_digest() {
 }
 
 # 目标里有 want（如 linux/arm64，或只写 arm64）这个平台吗
+#
+# 思路：让 skopeo 自己"按这个平台去选"——选得到就说明有：
+#   * 多架构 index：里面没有该平台时，skopeo 直接报错
+#   * 单架构镜像：选中后报出来的就是它真实的架构，对不上就是没有
+# 再用 manifest 原文兜一层（防 skopeo 版本间行为差异）。
 target_has_arch() {
   local ref="$1" want="${2:-$REQUIRE_ARCH}"
-  local want_os="" want_arch="$want" out="" raw=""
-  if [[ "$want" == */* ]]; then want_os="${want%%/*}"; want_arch="${want##*/}"; fi
+  local want_arch="$want" got="" raw="" out="" saved="$SKOPEO_PLAT"
+
+  if [[ "$want" != */* ]]; then want="linux/$want"; fi    # 只写 arm64 时补上 os
+  want_arch="${want##*/}"
+  local want_os="${want%%/*}"
 
   if have_skopeo && { [[ "$MODE" == "skopeo" ]] || ! have docker; }; then
+    SKOPEO_PLAT="$want"        # 让 skopeo_args_g 生成 --override-os / --override-arch
+    got="$(skopeo_inspect --format '{{.Architecture}}' "docker://$ref" 2>/dev/null || true)"
+    SKOPEO_PLAT="$saved"
+    if [[ "$got" == "$want_arch" ]]; then return 0; fi
+
     raw="$(skopeo_inspect --raw "docker://$ref" 2>/dev/null || true)"
-    if [[ -n "$raw" ]] && ! grep -q '"manifests"' <<< "$raw"; then
-      # 单架构镜像：没有平台列表，只能看 config
-      local a o
-      a="$(skopeo_inspect --format '{{.Architecture}}' "docker://$ref" 2>/dev/null || true)"
-      o="$(skopeo_inspect --format '{{.Os}}' "docker://$ref" 2>/dev/null || true)"
-      [[ "$a" == "$want_arch" && ( -z "$want_os" || -z "$o" || "$o" == "$want_os" ) ]] && return 0 || return 1
+    if grep -q "\"architecture\"[[:space:]]*:[[:space:]]*\"$want_arch\"" <<< "$raw"; then
+      return 0
     fi
-    grep -q "\"architecture\"[[:space:]]*:[[:space:]]*\"$want_arch\"" <<< "$raw" && return 0 || return 1
+    return 1
   fi
 
   out="$(docker buildx imagetools inspect "$ref" 2>&1 || true)"
   [[ -n "$out" ]] || out="$(docker manifest inspect "$ref" 2>&1 || true)"
-  if [[ -n "$want_os" ]]; then
-    grep -q -- "$want_os/$want_arch" <<< "$out"
-  else
-    grep -q -- "$want_arch" <<< "$out"
-  fi
+  if grep -q -- "$want_os/$want_arch" <<< "$out"; then return 0; fi
+  grep -q -- "$want_arch" <<< "$out"
 }
 
 # ---------------------------------------------------------------------------
@@ -364,7 +370,9 @@ do_imagetools() {
 
 do_skopeo() {
   local src="$1" dst="$2"
-  local -a cargs=(copy --retry-times "$SKOPEO_RETRY_TIMES")
+  # 注意：这里不要写 `copy` —— skopeo_copy 已经拼了子命令，重复会变成
+  # `skopeo copy copy ...`，skopeo 会把 "copy" 当成源镜像名而报 transport 错误。
+  local -a cargs=(--retry-times "$SKOPEO_RETRY_TIMES")
   if [[ -n "$SRC_CREDS" ]];  then cargs+=(--src-creds "$SRC_CREDS"); fi
   if [[ -n "$DEST_CREDS" ]]; then cargs+=(--dest-creds "$DEST_CREDS"); fi
   if [[ "$SRC_TLS_VERIFY" == "false" ]];  then cargs+=(--src-tls-verify=false); fi
