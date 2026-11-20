@@ -43,6 +43,7 @@ DRY_RUN="${DRY_RUN:-}"
 ALLOW_FAIL="${ALLOW_FAIL:-}"                    # 非空 = 有失败也返回 0
 EXTRA_IMAGES="${EXTRA_IMAGES:-}"                # 临时追加的镜像，空白/换行分隔
 ONLY="${ONLY:-}"                                # 只同步这些源镜像，逗号分隔
+INVENTORY_DIR="${INVENTORY_DIR:-}"              # 产出清单文件的目录（空=不产出）
 
 # 目标若是 http / 自签证书的 registry，置 false
 SRC_TLS_VERIFY="${SRC_TLS_VERIFY:-true}"
@@ -412,8 +413,10 @@ run_logged() {
 }
 
 RESULT_FILE=""
+# 字段分隔符同样用 \x1f 而不是 \t：\t 是 IFS 空白字符，会把空字段折叠掉
+# （digest 取不到时，note 会串到 digest 列上）
 emit() {
-  printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$4" "$5" "$6" >> "$RESULT_FILE"
+  printf '%s\x1f%s\x1f%s\x1f%s\x1f%s\x1f%s\n' "$1" "$2" "$3" "$4" "$5" "$6" >> "$RESULT_FILE"
 }
 
 # ---------------------------------------------------------------------------
@@ -489,6 +492,96 @@ run_all() {
 }
 
 # ---------------------------------------------------------------------------
+# 清单产物：inventory.json / INVENTORY.md / counts.env
+# 给 workflow 发布 Release 用（Actions 页面之外，Releases 页面也能一眼看到"都有什么"）
+# INVENTORY_DIR 为空则不产出 —— 本地跑默认不产出，免得污染工作区
+# ---------------------------------------------------------------------------
+json_esc() { printf '%s' "$1" | tr -d '\\"'; }
+
+write_inventory() {
+  local dir="${INVENTORY_DIR:-}"
+  if [[ -z "$dir" ]]; then return 0; fi
+  if [[ -n "$DRY_RUN" ]]; then return 0; fi
+
+  local ts run_url idx st src dst digest note
+  local ok=0 skip=0 fail=0 dry=0 total=0
+  ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  run_url=""
+  if [[ -n "${GITHUB_SERVER_URL:-}" && -n "${GITHUB_REPOSITORY:-}" && -n "${GITHUB_RUN_ID:-}" ]]; then
+    run_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+  fi
+
+  while IFS="$SEP" read -r idx st src dst digest note; do
+    total=$((total + 1))
+    case "$st" in
+      OK)   ok=$((ok + 1)) ;;
+      SKIP) skip=$((skip + 1)) ;;
+      DRY)  dry=$((dry + 1)) ;;
+      *)    fail=$((fail + 1)) ;;
+    esac
+  done < <(sort -n "$RESULT_FILE")
+
+  mkdir -p "$dir"
+
+  # 给 workflow 直接 source 的计数
+  {
+    printf 'OK=%s\n' "$ok"
+    printf 'SKIP=%s\n' "$skip"
+    printf 'FAIL=%s\n' "$fail"
+    printf 'DRY=%s\n' "$dry"
+    printf 'TOTAL=%s\n' "$total"
+  } > "$dir/counts.env"
+
+  # 机器可读（第二步的工具/脚本可以直接读它来知道有哪些镜像）
+  {
+    printf '{\n'
+    printf '  "generated_at": "%s",\n' "$ts"
+    printf '  "target_registry": "%s",\n' "$(json_esc "$TARGET_REGISTRY")"
+    printf '  "target_namespace": "%s",\n' "$(json_esc "$TARGET_NAMESPACE")"
+    printf '  "mode": "%s",\n' "$MODE"
+    if [[ -n "$run_url" ]]; then printf '  "run_url": "%s",\n' "$run_url"; fi
+    printf '  "counts": { "ok": %s, "skip": %s, "fail": %s, "total": %s },\n' "$ok" "$skip" "$fail" "$total"
+    printf '  "images": [\n'
+    local first=1
+    while IFS="$SEP" read -r idx st src dst digest note; do
+      if (( first )); then first=0; else printf ',\n'; fi
+      printf '    { "source": "%s", "target": "%s", "digest": "%s", "status": "%s", "note": "%s" }' \
+        "$(json_esc "$src")" "$(json_esc "$dst")" "$(json_esc "$digest")" "$st" "$(json_esc "$note")"
+    done < <(sort -n "$RESULT_FILE")
+    printf '\n  ]\n}\n'
+  } > "$dir/inventory.json"
+
+  # 人看
+  {
+    printf '# 镜像清单\n\n'
+    printf '> 每次搬运成功后自动更新，请勿手工编辑。\n\n'
+    printf -- '- 最后更新：%s\n' "$ts"
+    printf -- '- 目标 registry：`%s/%s`\n' "$TARGET_REGISTRY" "$TARGET_NAMESPACE"
+    printf -- '- 搬运方式：`%s`\n' "$MODE"
+    if [[ -n "$run_url" ]]; then printf -- '- 本次运行：%s\n' "$run_url"; fi
+    printf -- '- 统计：搬到 **%s** 个 / 目标已有 **%s** 个 / 失败 **%s** 个（共 %s）\n\n' "$ok" "$skip" "$fail" "$total"
+    printf '| 源镜像 | 目标镜像 | digest | 状态 |\n'
+    printf '|---|---|---|---|\n'
+    while IFS="$SEP" read -r idx st src dst digest note; do
+      local mark="$st"
+      case "$st" in
+        OK)   mark='✅ 已搬' ;;
+        SKIP) mark='⏭️ 已存在' ;;
+        FAIL) mark='❌ 失败' ;;
+      esac
+      printf '| `%s` | `%s` | `%s` | %s |\n' "$src" "$dst" "${digest:--}" "$mark"
+    done < <(sort -n "$RESULT_FILE")
+    printf '\n取件（包若是 private 先登录）：\n\n'
+    printf '```bash\n'
+    printf 'docker login %s -u <你的用户名>\n' "$TARGET_REGISTRY"
+    printf 'docker pull <上面的目标镜像>\n'
+    printf '```\n'
+  } > "$dir/INVENTORY.md"
+
+  printf '  清单已产出：%s（inventory.json / INVENTORY.md / counts.env）\n' "$dir"
+}
+
+# ---------------------------------------------------------------------------
 # 汇总
 # ---------------------------------------------------------------------------
 report() {
@@ -496,7 +589,7 @@ report() {
 
   printf '\n%s================ 搬运结果 ================%s\n' "$C_CYAN" "$C_OFF"
   printf '%-3s %-5s %-56s %s\n' "#" "状态" "源镜像" "目标镜像"
-  while IFS=$'\t' read -r idx st src dst digest note; do
+  while IFS="$SEP" read -r idx st src dst digest note; do
     printf '%-3s %-5s %-56s %s\n' "$idx" "$st" "$src" "$dst"
     if [[ -n "$digest" && "$digest" != "-" ]]; then printf '%*sdigest %s\n' 9 "" "$digest"; fi
     if [[ -n "$note" ]]; then printf '%*s%s\n' 9 "" "$note"; fi
@@ -518,7 +611,7 @@ report() {
       echo
       echo "| # | 状态 | 源镜像 | 目标镜像 | digest / 说明 |"
       echo "|---|---|---|---|---|"
-      while IFS=$'\t' read -r idx st src dst digest note; do
+      while IFS="$SEP" read -r idx st src dst digest note; do
         if [[ "$digest" == "-" ]]; then digest=""; fi
         echo "| $idx | $st | \`$src\` | \`$dst\` | ${digest}${note:+ $note} |"
       done < <(sort -n "$RESULT_FILE")
@@ -529,6 +622,8 @@ report() {
       echo "> 目标包若是 private，取件方需要凭据；要让匿名可拉请在 registry 侧改成 public。"
     } >> "$GITHUB_STEP_SUMMARY"
   fi
+
+  write_inventory
 
   if (( fail > 0 )) && [[ -z "$ALLOW_FAIL" ]]; then
     printf '\n%s有 %s 个镜像失败，退出码 1（设 ALLOW_FAIL=1 可忽略失败）%s\n' "$C_RED" "$fail" "$C_OFF" >&2

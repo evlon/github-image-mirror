@@ -119,6 +119,29 @@ docker.io/library/postgres:17   mirror=docker.m.daocloud.io
 
 改 README 之类不触发，省 Actions 额度。
 
+### 4.1 跑完以后：自动更新一份「镜像清单」Release
+
+每次搬运结束（**哪怕部分镜像失败也会更新**，如实反映现状）都会刷新 Releases 页面上一个固定标签的 Release：
+
+```
+https://github.com/<你>/<仓库>/releases/tag/images      # 标题：镜像清单（自动维护）
+```
+
+里面就是"现在都有什么"：
+
+| 内容 | 说明 |
+|---|---|
+| Release 正文 | 一张表：源镜像 → 目标镜像 + digest + 状态（✅ 已搬 / ⏭️ 已存在 / ❌ 失败），外加统计和本次运行链接 |
+| 附件 `INVENTORY.md` | 同一张表，方便下载/贴给别人 |
+| 附件 `inventory.json` | 机器可读（含 `target_registry` / `images[]` / `counts`），**将来第二步的取件工具可以直接读它来决定拉什么** |
+
+几个行为约定：
+
+- 标签固定为 `images`（**滚动更新**，同一个 URL 永远是最新清单，不会把 Releases 页面刷满）
+- 本次既没有新搬成功的、也没有已存在的（`OK=SKIP=0`）→ 不更新
+- `dry-run` 不更新
+- 想要每次搬运都留一份历史快照，就把 `sync.yml` 里那个 `TAG='images'` 改成带时间的标签，例如 `TAG="images-$(date -u +%Y%m%d-%H%M%S)"`
+
 ---
 
 ## 5. 可调参数

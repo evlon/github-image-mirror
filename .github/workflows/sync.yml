@@ -55,7 +55,7 @@ on:
     - cron: '17 3 * * 1'   # 每周一 03:17 UTC（北京时间 11:17）
 
 permissions:
-  contents: read
+  contents: write        # 发布/更新镜像清单 Release 需要
   packages: write        # 推 GHCR 必需；换成别的 registry 可去掉
 
 concurrency:
@@ -110,10 +110,36 @@ jobs:
           DRY_RUN: ${{ inputs.dry_run && '1' || '' }}
           EXTRA_IMAGES: ${{ inputs.images }}
           JOBS: '4'
+          # 产出清单文件，下一步发布成 Release（Releases 页面就能看到"都有什么"）
+          INVENTORY_DIR: inventory
           # skopeo 模式下用 GITHUB_TOKEN 推 GHCR；换 registry 就用自己的 secret
           SRC_CREDS: ${{ secrets.SRC_CREDS }}
           DEST_CREDS: ${{ secrets.DEST_CREDS || (inputs.mode == 'skopeo' && format('{0}:{1}', github.actor, secrets.GITHUB_TOKEN)) || '' }}
         run: bash scripts/mirror.sh
+
+      - name: 发布/更新镜像清单 Release
+        # 只要清单产出了就更新（哪怕部分镜像失败也要如实反映），dry-run 不发布
+        if: ${{ always() && hashFiles('inventory/counts.env') != '' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC1091
+          source inventory/counts.env
+          TAG='images'
+          TITLE='镜像清单（自动维护）'
+          if [[ "${OK:-0}" -eq 0 && "${SKIP:-0}" -eq 0 ]]; then
+            echo "本次没有可用产物（OK=$OK SKIP=$SKIP），不更新 Release"
+            exit 0
+          fi
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release edit "$TAG" --title "$TITLE" --notes-file inventory/INVENTORY.md
+          else
+            gh release create "$TAG" --title "$TITLE" --latest \
+              --notes-file inventory/INVENTORY.md
+          fi
+          gh release upload "$TAG" inventory/inventory.json inventory/INVENTORY.md --clobber
+          echo "::notice::镜像清单已更新：${{ github.server_url }}/${{ github.repository }}/releases/tag/$TAG"
 
       - name: 结果提示
         if: always()

@@ -8,6 +8,9 @@
 # 脚本生成的取件命令清单
 pull-list.txt
 
+# 搬运清单产物（由 workflow 生成并发布成 Release）
+inventory/
+
 # 本地跑脚本时的临时目录
 .tmp/
 out/
