@@ -12,11 +12,7 @@
 #   bash scripts/mirror.sh --force            # 已存在的 tag 也重推
 #   bash scripts/mirror.sh --only quay.io/ascend/vllm-ascend:v0.32.0rc1-a3-openeuler
 #   SYNC_MODE=skopeo bash scripts/mirror.sh   # 指定搬运方式
-#
-# 中转模式（第二步：把你镜像仓库里的东西推到别处，可经 SSH 隧道）：
-#   TARGET_NAMESPACE=me --relay 模式示例：
-#   TARGET_REGISTRY=localhost:5000 TARGET_NAMESPACE=mirror RELAY_FROM_NAMESPACE=me \
-#     DEST_TLS_VERIFY=false bash scripts/mirror.sh --relay --insecure-dest
+#   目标若是 http registry：bash scripts/mirror.sh --insecure-dest
 #
 # 三种搬运方式（都不落本地磁盘）：
 #   skopeo       skopeo copy：registry → registry 直拷，自带 blob 级重试；
@@ -48,24 +44,9 @@ ALLOW_FAIL="${ALLOW_FAIL:-}"                    # 非空 = 有失败也返回 0
 EXTRA_IMAGES="${EXTRA_IMAGES:-}"                # 临时追加的镜像，空白/换行分隔
 ONLY="${ONLY:-}"                                # 只同步这些源镜像，逗号分隔
 
-# ---------------------------------------------------------------------------
-# 中转（relay）模式 —— "第二步"
-#
-# 第一步（本仓库 / Actions）：上游 --直连--> 你的镜像仓库
-# 第二步（本机，可经 SSH 隧道）：你的镜像仓库 --中转--> 内网或机器旁的 registry
-#
-# 打开后：源不再是上游镜像，而是"你的镜像仓库里对应的那个名字"；
-#         目标则是 TARGET_REGISTRY/TARGET_NAMESPACE 指向的地方（如 localhost:5000）。
-# 典型用途：Windows 上 skopeo.exe 推不动上游，但能连 GHCR；
-#           GHCR --(本机中转)--> ssh -L 隧道 --> 910c 侧的 registry。
-# ---------------------------------------------------------------------------
-FROM_MIRROR="${FROM_MIRROR:-}"
-RELAY_FROM_REGISTRY="${RELAY_FROM_REGISTRY:-ghcr.io}"    # 第一步搬到哪儿了
-RELAY_FROM_NAMESPACE="${RELAY_FROM_NAMESPACE:-}"         # 默认同 TARGET_NAMESPACE
-DERIVE_REGISTRY="$TARGET_REGISTRY"                       # 运行期：目标名推导用哪一套
-DERIVE_NAMESPACE="$TARGET_NAMESPACE"
-SRC_TLS_VERIFY="${SRC_TLS_VERIFY:-true}"                 # false = 源是 http / 自签证书
-DEST_TLS_VERIFY="${DEST_TLS_VERIFY:-true}"               # false = 目标是 http / 自签证书
+# 目标若是 http / 自签证书的 registry，置 false
+SRC_TLS_VERIFY="${SRC_TLS_VERIFY:-true}"
+DEST_TLS_VERIFY="${DEST_TLS_VERIFY:-true}"
 
 # skopeo 相关
 SKOPEO_BIN="${SKOPEO_BIN:-skopeo}"              # 可指向 skopeo.exe 的完整路径
@@ -149,16 +130,7 @@ derive_target() {
   flat="$(printf '%s' "$flat" | tr 'A-Z' 'a-z')"
   flat="$(printf '%s' "$flat" | tr -c 'a-z0-9_-' '-')"
   flat="${flat%-}"
-  printf '%s/%s/%s:%s' "$DERIVE_REGISTRY" "$DERIVE_NAMESPACE" "$flat" "$tag"
-}
-
-# 把一个引用从旧 registry/namespace 挪到新的（中转模式用）
-#   ghcr.io/me/flat:tag + (localhost:5000, mirror) → localhost:5000/mirror/flat:tag
-retarget_ref() {
-  local ref="$1" reg="$2" ns="$3" path rest
-  path="${ref#*/}"                                  # 去掉原 registry host
-  if [[ "$path" == */* ]]; then rest="${path#*/}"; else rest="$path"; fi
-  printf '%s/%s/%s' "$reg" "$ns" "$rest"
+  printf '%s/%s/%s:%s' "$TARGET_REGISTRY" "$TARGET_NAMESPACE" "$flat" "$tag"
 }
 
 # 查 mirrors.env：某 host 是否有替换前缀
@@ -446,22 +418,11 @@ sync_one() {
   # 逐行选项优先，其次全局默认
   SKOPEO_PLAT="${plat:-$PLATFORMS}"
   arch="${arch:-$REQUIRE_ARCH}"
-
-  if [[ -n "$FROM_MIRROR" ]]; then
-    # 中转模式：源 = 你的镜像仓库里的那个名字（就是 $dst），目标 = TARGET_*
-    pull_src="$dst"
-    dst="$(retarget_ref "$dst" "$TARGET_REGISTRY" "$TARGET_NAMESPACE")"
-  else
-    pull_src="$(apply_mirror "$src" "$mir")"
-  fi
+  pull_src="$(apply_mirror "$src" "$mir")"
 
   printf '\n%s==> [%s/%s] %s%s\n' "$C_CYAN" "$idx" "$TOTAL" "$src" "$C_OFF"
   printf '    目标：%s\n' "$dst"
-  if [[ -n "$FROM_MIRROR" ]]; then
-    printf '    从镜像仓库中转：%s\n' "$pull_src"
-  elif [[ "$pull_src" != "$src" ]]; then
-    printf '    取源走镜像站：%s\n' "$pull_src"
-  fi
+  if [[ "$pull_src" != "$src" ]]; then printf '    取源走镜像站：%s\n' "$pull_src"; fi
   if [[ -n "$SKOPEO_PLAT" ]]; then printf '    平台限定：%s\n' "$SKOPEO_PLAT"; fi
 
   if [[ -n "$DRY_RUN" ]]; then
@@ -556,7 +517,7 @@ report() {
       echo
       echo "成功 $ok / 跳过 $skip / 演示 $dry / 失败 $fail（共 $TOTAL）"
       echo
-      echo "> 取件：\`bash scripts/pull.sh\`（或 \`-Platforms\` 版 \`scripts/mirror.ps1 -DryRun\` 先看一眼）"
+      echo "> 取件：在自己机器上 \`docker pull <目标镜像>\`（该平台用 \`--platform\` 指定）"
       echo "> 目标包若是 private，取件方需要凭据；要让匿名可拉请在 registry 侧改成 public。"
     } >> "$GITHUB_STEP_SUMMARY"
   fi
@@ -573,7 +534,6 @@ parse_args() {
     case "$1" in
       --dry-run) DRY_RUN=1 ;;
       --force)   FORCE=1 ;;
-      --relay)   FROM_MIRROR=1 ;;
       --insecure-src)  SRC_TLS_VERIFY=false ;;
       --insecure-dest) DEST_TLS_VERIFY=false ;;
       --only)    shift; ONLY="${1:-}" ;;
@@ -591,13 +551,6 @@ main() {
   parse_args "$@"
   [[ -n "$TARGET_NAMESPACE" ]] || die "TARGET_NAMESPACE 没设置（例如 TARGET_NAMESPACE=<你的GitHub用户名>）"
   resolve_mode
-  if [[ -n "$FROM_MIRROR" ]]; then
-    DERIVE_REGISTRY="$RELAY_FROM_REGISTRY"
-    DERIVE_NAMESPACE="${RELAY_FROM_NAMESPACE:-$TARGET_NAMESPACE}"
-    if [[ -z "$DERIVE_NAMESPACE" ]]; then
-      die "--relay 模式需要 RELAY_FROM_NAMESPACE（或 TARGET_NAMESPACE）才能推出镜像仓库里的名字"
-    fi
-  fi
   load_items
   TOTAL=${#ITEMS[@]}
 
@@ -605,10 +558,6 @@ main() {
   trap 'rm -f "$RESULT_FILE"' EXIT
 
   log "配置"
-  if [[ -n "$FROM_MIRROR" ]]; then
-    printf '  模式          : 中转（relay）—— 从你的镜像仓库推到目标 registry\n'
-    printf '  中转来源      : %s/%s\n' "$DERIVE_REGISTRY" "$DERIVE_NAMESPACE"
-  fi
   printf '  目标 registry : %s/%s\n' "$TARGET_REGISTRY" "$TARGET_NAMESPACE"
   printf '  搬运方式      : %s%s\n' "$MODE" "$([[ -n "$DRY_RUN" ]] && echo '（dry-run）' || true)"
   printf '  清单文件      : %s（%s 个镜像）\n' "$IMAGES_FILE" "$TOTAL"
@@ -625,7 +574,7 @@ main() {
   report
 }
 
-# 作为库被 source 时只加载函数，不执行（scripts/pull.sh 会用）
+# 作为库被 source 时只加载函数，不执行
 if [[ -n "${MIRROR_LIB_ONLY:-}" ]]; then
   return 0 2>/dev/null || exit 0
 fi

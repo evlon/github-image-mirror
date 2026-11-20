@@ -21,10 +21,8 @@
     # 4) 只保留 arm64 一份（给 arm64 服务器用，能省一半流量）
     .\scripts\mirror.ps1 -Platforms linux/arm64
 
-    # 5) 第二步·中转：把你镜像仓库里的东西推到 910c 侧的 registry
-    #    （先在另一个窗口开隧道：ssh -N -L 5000:127.0.0.1:5000 user@910c）
-    .\scripts\mirror.ps1 -Relay -FromNamespace <你的用户名> `
-        -TargetRegistry localhost:5000 -TargetNamespace mirror -InsecureDest
+    # 5) 目标若是 http registry（自建 registry 常这样）
+    .\scripts\mirror.ps1 -TargetNamespace <你的用户名> -InsecureDest
 
 .NOTES
     清单行格式：<源镜像> [目标镜像] [选项...]，选项支持 platform= / require_arch= / mirror=，
@@ -49,10 +47,7 @@ param(
     [string]   $DestCreds,
     [int]      $RetryTimes      = 3,
 
-    # 中转模式（第二步：把你镜像仓库里的东西推到别处，可经 SSH 隧道）
-    [switch]   $Relay,
-    [string]   $FromRegistry  = 'ghcr.io',
-    [string]   $FromNamespace,
+    # 目标若是 http registry（自建 registry 常这样）
     [switch]   $InsecureSrc,
     [switch]   $InsecureDest,
 
@@ -66,10 +61,6 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-
-# 目标名推导用哪一套 registry/namespace（中转模式下换成"你的镜像仓库"那一套）
-$script:DeriveRegistry  = $TargetRegistry
-$script:DeriveNamespace = $TargetNamespace
 
 $script:Ok = 0; $script:Skip = 0; $script:Fail = 0; $script:Dry = 0
 $script:Results = New-Object System.Collections.ArrayList
@@ -108,18 +99,7 @@ function Get-TargetRef([string]$src) {
     $flat = $p.Name -replace '[/.]', '-'
     $flat = $flat.ToLowerInvariant()
     $flat = [regex]::Replace($flat, '[^a-z0-9_-]', '-').TrimEnd('-')
-    return "$script:DeriveRegistry/$script:DeriveNamespace/${flat}:$($p.Tag)"
-}
-
-# 把一个引用从旧 registry/namespace 挪到新的（中转模式用）
-#   ghcr.io/me/flat:tag + (localhost:5000, mirror) → localhost:5000/mirror/flat:tag
-function Retarget-Ref([string]$ref, [string]$reg, [string]$ns) {
-    $slash = $ref.IndexOf('/')
-    if ($slash -lt 0) { return $ref }
-    $path = $ref.Substring($slash + 1)
-    $s2 = $path.IndexOf('/')
-    $rest = if ($s2 -ge 0) { $path.Substring($s2 + 1) } else { $path }
-    return "$reg/$ns/$rest"
+    return "$TargetRegistry/$TargetNamespace/${flat}:$($p.Tag)"
 }
 
 function Get-MirrorForHost([string]$host_) {
@@ -158,7 +138,7 @@ if ($InsecureDest) { $script:I += @('--tls-verify=false') }
 if ($AuthFile) {
     if (-not (Test-Path -LiteralPath $AuthFile)) { Die "AuthFile 不存在：$AuthFile" }
     $script:A += @('--authfile', $AuthFile)
-} elseif (-not $DestCreds -and -not $SourceCreds -and -not $env:GHCR_USER) {
+} elseif (-not $DestCreds -and -not $env:GHCR_USER) {
     # 没给显式凭据时，才退回 docker config（注意 Docker Desktop 的 credsStore 可能不可用）
     $cfg = Join-Path $env:USERPROFILE '.docker\config.json'
     if (Test-Path -LiteralPath $cfg) { $script:A += @('--authfile', $cfg) }
@@ -225,18 +205,8 @@ function Test-TargetHasArch([string]$ref, [string]$want) {
 # 主流程
 # ---------------------------------------------------------------------------
 if (-not $TargetNamespace) { Die "没给 TargetNamespace（-TargetNamespace 或环境变量 TARGET_NAMESPACE）" }
-if ($Relay) {
-    if (-not $FromNamespace) { Die "-Relay 需要 -FromNamespace（你镜像仓库的命名空间，如你的 GitHub 用户名）" }
-    $script:DeriveRegistry  = $FromRegistry
-    $script:DeriveNamespace = $FromNamespace
-}
 if (-not (Test-Path -LiteralPath $ImagesFile)) { Die "找不到清单文件：$ImagesFile" }
 if (-not $DestCreds -and $env:GHCR_USER -and $env:GHCR_TOKEN) { $DestCreds = "$($env:GHCR_USER):$($env:GHCR_TOKEN)" }
-if ($Relay -and -not $SourceCreds -and $env:GHCR_USER -and $env:GHCR_TOKEN) {
-    # 中转模式下 GHCR 是"源"，凭据该给 --src-creds，不能还留在 dest 上
-    $SourceCreds = "$($env:GHCR_USER):$($env:GHCR_TOKEN)"
-    $DestCreds   = ''
-}
 
 $skopeoCmd = Get-Command $Skopeo -ErrorAction SilentlyContinue
 if (-not $skopeoCmd) { Die "找不到 skopeo：$Skopeo（用 -Skopeo 指定 skopeo.exe 的完整路径）" }
@@ -272,18 +242,11 @@ if ($Only) {
 if ($items.Count -eq 0) { Die "$ImagesFile 里没有任何镜像" }
 
 Write-Head '配置'
-if ($Relay) {
-    Write-Host "  模式          : 中转（relay）—— 从你的镜像仓库推到目标 registry"
-    Write-Host "  中转来源      : $script:DeriveRegistry/$script:DeriveNamespace"
-}
 Write-Host "  目标 registry : $TargetRegistry/$TargetNamespace"
 Write-Host "  同步工具      : $Skopeo（registry→registry 直拷，本地不占磁盘）"
 Write-Host "  清单文件      : $ImagesFile（$($items.Count) 个镜像）"
 Write-Host "  镜像站替换表  : $MirrorsFile"
-if ($Relay) {
-    if ($SourceCreds) { Write-Host "  拉取凭据      : 已提供（$($SourceCreds.Split(':')[0]):***）" }
-    else { Write-Warn2 '中转模式没给凭据：你镜像仓库里的包若是 private，skopeo 会 401（设 GHCR_USER/GHCR_TOKEN，或用 -SourceCreds）' }
-} elseif ($DestCreds) {
+if ($DestCreds) {
     Write-Host "  推送凭据      : 已提供（$($DestCreds.Split(':')[0]):***）"
 } else {
     Write-Warn2 '没有提供推送凭据 —— 除非目标包是 public 且你已有 docker login，否则推送会 401'
@@ -299,19 +262,12 @@ foreach ($it in $items) {
     $effPlat = if ($it.Plat) { $it.Plat } else { $Platforms }
     $effArch = if ($it.Arch) { $it.Arch } else { $RequireArch }
     $script:Plat = $effPlat
-    if ($Relay) {
-        # 中转模式：源 = 你镜像仓库里的那个名字（$dst），目标 = 新的 registry/namespace
-        $pullSrc = $dst
-        $dst = Retarget-Ref $dst $TargetRegistry $TargetNamespace
-    } else {
-        $pullSrc = if ($it.Mir) { "$($it.Mir.TrimEnd('/'))/" + $src.Substring($src.IndexOf('/') + 1) } else { Get-PullRef $src }
-    }
+    $pullSrc = if ($it.Mir) { "$($it.Mir.TrimEnd('/'))/" + $src.Substring($src.IndexOf('/') + 1) } else { Get-PullRef $src }
     $digest = ''; $note = ''
 
     Write-Head "[$idx/$($items.Count)] $src"
     Write-Host "    目标：$dst"
-    if ($Relay) { Write-Host "    从镜像仓库中转：$pullSrc" }
-    elseif ($pullSrc -ne $src) { Write-Host "    取源走镜像站：$pullSrc" }
+    if ($pullSrc -ne $src) { Write-Host "    取源走镜像站：$pullSrc" }
     if ($effPlat) { Write-Host "    平台限定：$effPlat" }
 
     if ($DryRun) {
