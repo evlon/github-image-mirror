@@ -1,0 +1,120 @@
+name: export-image-to-release
+
+# =============================================================================
+# 可选的第二条取件通道（与本仓库的 GHCR 同步互不影响，不需要就删掉这个文件）
+#
+# 为什么要有它：910c 到 registry 的链路会在「单个大 blob 的长连接」中途断掉，
+# 而 docker pull / skopeo 的 --retry-times 都是整 blob 级重试，不做 HTTP Range 续传。
+# 转成 Release 资产后：
+#   * 用 curl -C - / aria2c 可以断点续传，断了接着下，不用从头再来
+#   * 分片下载，某一片坏了只重下那一片
+#   * 走你的 GitHub 镜像前缀也能下
+#
+# ⚠️ 它需要把镜像 pull 到 runner 本地再 docker save，磁盘需求约 2 倍镜像大小
+#    （example: 9 GiB 镜像 ≈ 20 GiB）。所以：手动触发、先清盘、只导单个镜像。
+# =============================================================================
+on:
+  workflow_dispatch:
+    inputs:
+      image:
+        description: '要导出的镜像（含 tag）。建议直接写官方名，这样 910c docker load 后名字就是它'
+        required: true
+        type: string
+      release_tag:
+        description: 'Release 标签（留空自动生成）'
+        required: false
+        type: string
+      platform:
+        description: '平台'
+        required: true
+        default: linux/arm64
+        type: string
+      compression:
+        description: '压缩方式（zstd 体积最小，gzip 兼容性最好）'
+        required: true
+        default: zstd
+        type: choice
+        options: [zstd, gzip, none]
+      part_size:
+        description: '分片大小（GitHub 单资产上限 2 GiB，别超过 1900M）'
+        required: true
+        default: 1900M
+        type: string
+
+permissions:
+  contents: write        # 建 Release、传资产
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - name: 腾出磁盘（默认 runner 只有约 14 GB 空闲，不够）
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /usr/local/share/boost /opt/hostedtoolcache/CodeQL \
+                      /usr/local/lib/node_modules /usr/share/swift || true
+          sudo docker image prune -af || true
+          df -h /
+
+      - name: 登录 GHCR（镜像若来自 ghcr.io 需要）
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: 拉取镜像（只拉指定平台）
+        env:
+          IMAGE: ${{ inputs.image }}
+          PLATFORM: ${{ inputs.platform }}
+        run: |
+          set -euo pipefail
+          echo "拉取 $IMAGE ($PLATFORM)"
+          docker pull --platform "$PLATFORM" "$IMAGE"
+          echo "架构核对："
+          docker image inspect "$IMAGE" --format '  {{.Architecture}} / {{.Os}}'
+          ARCH="$(docker image inspect "$IMAGE" --format '{{.Architecture}}')"
+          WANT="${PLATFORM##*/}"
+          [[ "$ARCH" == "$WANT" ]] || { echo "::error::拉到的是 $ARCH，不是 $WANT"; exit 1; }
+
+      - name: 导出 + 压缩 + 分片
+        env:
+          IMAGE: ${{ inputs.image }}
+          COMPRESSION: ${{ inputs.compression }}
+          PART_SIZE: ${{ inputs.part_size }}
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          NAME="$(printf '%s' "$IMAGE" | tr '/:' '__')"
+          BASE="out/${NAME}.tar"
+
+          case "$COMPRESSION" in
+            zstd) docker save "$IMAGE" | zstd -T0 -3 -o "${BASE}.zst" ;;
+            gzip) docker save "$IMAGE" | gzip -1 > "${BASE}.gz" ;;
+            none) docker save "$IMAGE" -o "${BASE}" ;;
+          esac
+
+          case "$COMPRESSION" in
+            zstd) PKG="${BASE}.zst" ;;
+            gzip) PKG="${BASE}.gz" ;;
+            none) PKG="${BASE}" ;;
+          esac
+
+          ls -lh "$PKG"
+          split -b "$PART_SIZE" -d --suffix-length=3 "$PKG" "${PKG}.part."
+          rm -f "$PKG"
+          sha256sum out/* > out/SHA256SUMS.txt
+          echo "=== 分片 ==="
+          ls -lh out/
+          cat out/SHA256SUMS.txt
+
+      - name: 建 Release 并上传
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          IMAGE: ${{ inputs.image }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          set -euo pipefail
+          TAG="${RELEASE_TAG:-img-$(printf '%s' "$IMAGE" | tr '/:' '__')}"
+          gh release view "$TAG" >/dev/null 2>&1 || \
+            gh release create "$TAG" --title "$IMAGE" --notes "镜像导出：\`$IMAGE\`"
+          gh release upload "$TAG" out/* --clobber
+          echo "::notice::取件方式见仓库 README 的「断点续传取件」一节，Release 标签：$TAG"
